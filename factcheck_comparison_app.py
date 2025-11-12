@@ -1,375 +1,456 @@
 # app.py
 """
-Streamlit app to compare truthfulness judgments between PolitiFact and FactCheck.org.
+Streamlit app to compare fact-check verdicts between
+BOOM Live (India) and Alt News (India).
 
-Save as app.py and run:
+How to run:
+    pip install -r requirements.txt
     streamlit run app.py
 
-Notes:
-- Scrapes both sites; HTML structures can change over time and break the parsers.
-- For more stable production use, prefer official APIs or RSS feeds (if available).
-- Be polite: don't hammer the servers. This app uses streamlit cache to reduce requests.
+Suggested requirements.txt:
+streamlit
+requests
+beautifulsoup4
+pandas
+rapidfuzz
+matplotlib
+scikit-learn
+python-dateutil
+
 """
 
 import streamlit as st
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
+from rapidfuzz import process, fuzz
 from datetime import datetime
-from rapidfuzz import fuzz, process
-import plotly.express as px
-import numpy as np
-from sklearn.metrics import confusion_matrix
+from dateutil import parser as dateparser
 import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import numpy as np
+import io
 
-st.set_page_config(page_title="PolitiFact ↔ FactCheck.org Truth Comparison", layout="wide")
+st.set_page_config(page_title="BOOM vs AltNews — Fact-check comparison", layout="wide")
 
-# --------------------------
-# Utilities & Normalization
-# --------------------------
-def normalize_rating(site: str, raw: str) -> str:
-    """Map raw rating string to canonical labels: TRUE, MOSTLY_TRUE, MIXED, MOSTLY_FALSE, FALSE, PANTS_ON_FIRE, UNKNOWN"""
-    if raw is None:
-        return "UNKNOWN"
-    text = raw.strip().lower()
-    # PolitiFact specific:
-    if "pants on fire" in text:
-        return "PANTS_ON_FIRE"
-    if "false" == text or text == "false." or "false" in text and "mostly" not in text:
-        # handle PolitiFact "False" and also FactCheck "False"
-        if "mostly" in text:
-            return "MOSTLY_FALSE"
-        return "FALSE"
-    if "mostly false" in text:
-        return "MOSTLY_FALSE"
-    if "mostly true" in text:
-        return "MOSTLY_TRUE"
-    if "true" == text or text == "true." or ("true" in text and "mostly" not in text):
-        return "TRUE"
-    if "half true" in text or "mixed" in text or "mixture" in text:
-        return "MIXED"
-    if "misleading" in text or "mostly misleading" in text:
-        return "MOSTLY_FALSE"
-    # FactCheck.org sometimes uses phrases rather than labels:
-    if "true" in text:
-        return "TRUE"
-    if "false" in text:
-        return "FALSE"
-    # fallback:
-    return "UNKNOWN"
+# ---------------------------
+# Utility / normalization
+# ---------------------------
 
-def rating_to_numeric(r: str) -> float:
-    """Convert canonical rating to numeric scale 0.0 (False) .. 1.0 (True)."""
-    mapping = {
-        "PANTS_ON_FIRE": 0.0,
-        "FALSE": 0.0,
-        "MOSTLY_FALSE": 0.15,
-        "MIXED": 0.5,
-        "MOSTLY_TRUE": 0.85,
-        "TRUE": 1.0,
-        "UNKNOWN": np.nan
-    }
-    return mapping.get(r, np.nan)
+VERDICT_MAPPING = {
+    # Generic mapping to numeric [0..1] and canonical label
+    # Adjust or extend as you see fit
+    'true': (1.0, 'True'),
+    'correct': (1.0, 'True'),
+    'mostly true': (0.9, 'Mostly True'),
+    'partly true': (0.6, 'Partly True'),
+    'half true': (0.5, 'Half True'),
+    'mixture': (0.5, 'Mixture'),
+    'mixed': (0.5, 'Mixture'),
+    'uncertain': (0.5, 'Uncertain'),
+    'no evidence': (0.2, 'No Evidence'),
+    'mostly false': (0.1, 'Mostly False'),
+    'false': (0.0, 'False'),
+    'misleading': (0.2, 'Misleading'),
+    'partly false': (0.2, 'Partly False'),
+    'satire': (0.0, 'Satire'),
+    'missing context': (0.3, 'Missing Context'),
+    'no verdict': (0.5, 'No Verdict'),
+}
 
-def safe_get(url, headers=None, timeout=12):
-    headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; PolitiFact-FactCheckComparer/1.0)"}
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+def normalize_verdict(text):
+    if not text or not isinstance(text, str):
+        return 0.5, 'No Verdict'
+    t = text.strip().lower()
+    # try to find a key in mapping contained in t
+    for k in VERDICT_MAPPING:
+        if k in t:
+            return VERDICT_MAPPING[k]
+    # fallback heuristics
+    if 'true' in t:
+        return 1.0, 'True'
+    if 'false' in t:
+        return 0.0, 'False'
+    if 'mislead' in t:
+        return 0.2, 'Misleading'
+    return 0.5, text.strip().title()
 
-# --------------------------
-# Scrapers (simple)
-# --------------------------
-@st.cache_data(show_spinner=False)
-def scrape_politifact_pages(num_pages=2):
-    """
-    Scrapes PolitiFact 'factchecks' index pages.
-    Returns: DataFrame with columns: claim, rating_raw, url, date
-    """
-    base = "https://www.politifact.com/factchecks/list/?page={}"
-    rows = []
-    for p in range(1, num_pages+1):
-        html = safe_get(base.format(p))
-        soup = BeautifulSoup(html, "html.parser")
-        # PolitiFact list items
-        items = soup.select("li.o-listicle__item") or soup.select("div.m-list__item")
-        if not items:
-            items = soup.select(".m-statement")  # fallback
-        for it in items:
-            # claim
-            claim_tag = it.select_one(".m-statement__quote") or it.select_one(".statement__quote") or it.select_one(".m-statement__content a")
-            claim = claim_tag.get_text(strip=True) if claim_tag else None
-            # rating
-            rating_tag = it.select_one(".m-statement__meter .c-image") or it.select_one(".m-statement__meter img") or it.select_one(".rating")
-            rating = None
-            if rating_tag:
-                # PolitiFact often uses alt text or title attribute
-                rating = rating_tag.get("alt") or rating_tag.get("title") or rating_tag.get_text(strip=True)
-            # link and date
-            link_tag = it.select_one("a[href*='/factchecks/']") or it.select_one("a")
-            url = "https://www.politifact.com" + link_tag["href"] if link_tag and link_tag.get("href", "").startswith("/") else (link_tag["href"] if link_tag else None)
-            date_tag = it.select_one(".m-statement__meta time") or it.select_one("time")
-            date = None
-            if date_tag:
-                date = date_tag.get("datetime") or date_tag.get_text(strip=True)
-            rows.append({"claim": claim, "rating_raw": rating, "source": "PolitiFact", "url": url, "date": date})
-    df = pd.DataFrame(rows)
-    # normalize date string
-    df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
-    df['rating_norm'] = df['rating_raw'].apply(lambda x: normalize_rating("politifact", x))
-    df['rating_numeric'] = df['rating_norm'].apply(rating_to_numeric)
-    return df
+# ---------------------------
+# Scrapers
+# ---------------------------
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; fact-compare-bot/1.0; +https://example.com/bot)"
+}
 
 @st.cache_data(show_spinner=False)
-def scrape_factcheck_pages(num_pages=2):
+def fetch_altnews_pages(pages=1):
     """
-    Scrapes FactCheck.org pages tagged 'FactChecking' or the site homepage list.
-    Returns DataFrame with columns: claim, rating_raw, url, date
+    Scrape Alt News fact-check listing pages.
+    Returns DataFrame with columns: claim, verdict_raw, url, date
     """
-    # FactCheck.org has a 'Fact-check' tag listing - we'll use pages like: https://www.factcheck.org/category/fact-check/
-    base = "https://www.factcheck.org/category/fact-check/page/{}/"
+    base = "https://www.altnews.in"
+    listing_url = base + "/category/fact-checks/page/{page}/"
     rows = []
-    for p in range(1, num_pages+1):
-        html = safe_get(base.format(p))
-        soup = BeautifulSoup(html, "html.parser")
-        posts = soup.select("article") or soup.select(".post")
-        for post in posts:
-            title_tag = post.select_one(".entry-title a") or post.select_one("h2 a") or post.select_one("h1 a")
-            title = title_tag.get_text(strip=True) if title_tag else None
-            url = title_tag["href"] if title_tag and title_tag.get("href") else None
-            # We'll open the post page to find the claim text and any verdict text inside the content
-            claim_text = title
-            rating_text = None
-            date_tag = post.select_one("time") or post.select_one(".entry-date")
-            date = date_tag.get("datetime") if date_tag and date_tag.get("datetime") else (date_tag.get_text(strip=True) if date_tag else None)
-            # Visit article page to search for likely verdict language
-            if url:
-                try:
-                    art = safe_get(url)
-                    asoup = BeautifulSoup(art, "html.parser")
-                    # FactCheck.org often includes a summary sentence near the top like "Verdict: False" or "Our ruling: False"
-                    content_text = asoup.select_one(".entry-content") or asoup.select_one(".post-content") or asoup
-                    content = content_text.get_text(" ", strip=True)[:800] if content_text else ""
-                    # find occurrence of "Verdict", "Ruling", "False", "True", "Misleading" etc.
-                    for token in ["Verdict:", "Verdict –", "Our ruling:", "Ruling:", "Bottom line:", "Conclusion:", "Rating:"]:
-                        if token in content:
-                            # take a small slice after token
-                            idx = content.find(token)
-                            snippet = content[idx: idx + 120]
-                            rating_text = snippet
-                            break
-                    # last resort: search content for the words true/false/misleading
-                    if not rating_text:
-                        for word in ["False", "True", "Mostly false", "Mostly true", "Misleading", "Pants on fire", "Mixture"]:
-                            if word.lower() in content.lower():
-                                rating_text = word
-                                break
-                    # sometimes the article subtitle contains summary
-                    subtitle = asoup.select_one(".entry-subtitle") or asoup.select_one(".subtitle")
-                    if not rating_text and subtitle:
-                        rating_text = subtitle.get_text(strip=True)
-                except Exception as e:
-                    rating_text = None
-            rows.append({"claim": claim_text, "rating_raw": rating_text, "source": "FactCheck.org", "url": url, "date": date})
-    df = pd.DataFrame(rows)
-    df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
-    df['rating_norm'] = df['rating_raw'].apply(lambda x: normalize_rating("factcheck", x))
-    df['rating_numeric'] = df['rating_norm'].apply(rating_to_numeric)
-    return df
+    for p in range(1, pages+1):
+        url = listing_url.format(page=p)
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            # AltNews lists posts in article tags or elements with "post"
+            articles = soup.select("article, .post")
+            if not articles:
+                # try common backup
+                articles = soup.select(".grid-item a")
+            for a in articles:
+                # find title and link
+                link = a.find("a", href=True)
+                if link:
+                    post_url = link['href']
+                else:
+                    # fallback - find first link inside
+                    link = a.select_one("a[href]")
+                    post_url = link['href'] if link else None
+                title = None
+                title_tag = a.select_one("h2, h3, .entry-title, .post-title")
+                if title_tag:
+                    title = title_tag.get_text(strip=True)
+                else:
+                    # fallback: link text
+                    title = link.get_text(strip=True) if link else None
 
-# --------------------------
-# Matching claims across sites
-# --------------------------
-def fuzzy_merge(df_left, df_right, left_on='claim', right_on='claim', threshold=80, limit=1):
-    """
-    Fuzzy match two dataframes on text columns.
-    Returns merged DataFrame with left claim and best matching right claim when score >= threshold.
-    """
-    right_choices = df_right[right_on].astype(str).tolist()
-    matches = []
-    for i, left_val in df_left[left_on].astype(str).iteritems():
-        if not left_val or left_val.strip() == "":
-            matches.append((None, 0, None))
+                # Visit post page to extract verdict and date
+                if post_url:
+                    try:
+                        pr = requests.get(post_url, headers=HEADERS, timeout=12)
+                        pr.raise_for_status()
+                        psoup = BeautifulSoup(pr.text, "html.parser")
+                        # common altnews selectors: verdict sometimes in a highlighted box, or within h2/h3 with 'Verdict' word
+                        verdict = None
+                        # look for 'Verdict' heading then capture sibling text
+                        vnode = psoup.find(lambda tag: tag.name in ['h2','h3','strong'] and 'verdict' in tag.get_text(strip=True).lower())
+                        if vnode:
+                            # get next sibling or next p
+                            nxt = vnode.find_next_sibling(['p','div','span'])
+                            if nxt:
+                                verdict = nxt.get_text(" ", strip=True)
+                        # try meta or badges
+                        if not verdict:
+                            # some posts have labels or spans with class 'rating' or 'verdict'
+                            vtag = psoup.select_one(".verdict, .rating, .result, .fact-check-result")
+                            if vtag:
+                                verdict = vtag.get_text(" ", strip=True)
+                        if not verdict:
+                            # fallback: search for common words in body
+                            body = psoup.get_text(" ", strip=True)
+                            # attempt to find substring 'Verdict:' in body
+                            if 'verdict' in body.lower():
+                                idx = body.lower().find('verdict')
+                                snippet = body[idx: idx+200]
+                                verdict = snippet.split(':',1)[-1].strip()
+                        # date
+                        date = None
+                        time_tag = psoup.find('time')
+                        if time_tag and time_tag.has_attr('datetime'):
+                            try:
+                                date = dateparser.parse(time_tag['datetime'])
+                            except:
+                                pass
+                        if not date:
+                            # try meta
+                            meta = psoup.find('meta', {'property':'article:published_time'}) or psoup.find('meta', {'name':'pubdate'})
+                            if meta and meta.get('content'):
+                                try:
+                                    date = dateparser.parse(meta['content'])
+                                except:
+                                    date = None
+                        rows.append({
+                            'claim': title,
+                            'verdict_raw': verdict,
+                            'url': post_url,
+                            'date': date
+                        })
+                    except Exception as e:
+                        # skip problematic post, continue
+                        continue
+        except Exception as e:
             continue
-        best = process.extractOne(left_val, right_choices, scorer=fuzz.token_sort_ratio)
-        if best:
-            match_str, score, idx = best  # idx is index in choices list
-            if score >= threshold:
-                right_row = df_right.iloc[idx]
-                matches.append((right_row[right_on], score, right_row.name))
-            else:
-                matches.append((None, score, None))
-        else:
-            matches.append((None, 0, None))
-    df_left = df_left.copy().reset_index(drop=True)
-    df_left['matched_claim_right'] = [m[0] for m in matches]
-    df_left['match_score'] = [m[1] for m in matches]
-    df_left['matched_right_idx'] = [m[2] for m in matches]
-    # attach right columns where matched
-    right_subset = df_right.reset_index()
-    merged_rows = []
-    for i, r in df_left.iterrows():
-        mr_idx = r['matched_right_idx']
-        if pd.notna(mr_idx):
-            right_row = right_subset[right_subset['index'] == mr_idx].squeeze()
-            merged_rows.append(pd.concat([r, right_row.add_prefix('right_')]))
-        else:
-            merged_rows.append(r)
-    merged = pd.DataFrame(merged_rows)
-    return merged
+    df = pd.DataFrame(rows)
+    return df
 
-# --------------------------
+@st.cache_data(show_spinner=False)
+def fetch_boom_pages(pages=1):
+    """
+    Scrape BOOM Live fact-check listing pages.
+    Returns DataFrame with columns: claim, verdict_raw, url, date
+    """
+    base = "https://www.boomlive.in"
+    listing_url = base + "/fact-checks/page/{page}/"
+    rows = []
+    for p in range(1, pages+1):
+        url = listing_url.format(page=p)
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            articles = soup.select("article, .post, .listing")
+            for a in articles:
+                link = a.find("a", href=True)
+                if link:
+                    post_url = link['href']
+                else:
+                    post_url = None
+                title_tag = a.select_one("h2, h3, .entry-title, .post-title")
+                title = title_tag.get_text(strip=True) if title_tag else (link.get_text(strip=True) if link else None)
+
+                if post_url:
+                    try:
+                        pr = requests.get(post_url, headers=HEADERS, timeout=12)
+                        pr.raise_for_status()
+                        psoup = BeautifulSoup(pr.text, "html.parser")
+                        verdict = None
+                        vnode = psoup.find(lambda tag: tag.name in ['h2','h3','strong'] and 'verdict' in tag.get_text(strip=True).lower())
+                        if vnode:
+                            nxt = vnode.find_next_sibling(['p','div','span'])
+                            if nxt:
+                                verdict = nxt.get_text(" ", strip=True)
+                        if not verdict:
+                            vtag = psoup.select_one(".verdict, .result, .factcheck-result, .rating")
+                            if vtag:
+                                verdict = vtag.get_text(" ", strip=True)
+                        if not verdict:
+                            body = psoup.get_text(" ", strip=True)
+                            if 'verdict' in body.lower():
+                                idx = body.lower().find('verdict')
+                                snippet = body[idx: idx+200]
+                                verdict = snippet.split(':',1)[-1].strip()
+                        # date
+                        date = None
+                        time_tag = psoup.find('time')
+                        if time_tag and time_tag.has_attr('datetime'):
+                            try:
+                                date = dateparser.parse(time_tag['datetime'])
+                            except:
+                                pass
+                        if not date:
+                            meta = psoup.find('meta', {'property':'article:published_time'}) or psoup.find('meta', {'name':'pubdate'})
+                            if meta and meta.get('content'):
+                                try:
+                                    date = dateparser.parse(meta['content'])
+                                except:
+                                    date = None
+                        rows.append({
+                            'claim': title,
+                            'verdict_raw': verdict,
+                            'url': post_url,
+                            'date': date
+                        })
+                    except Exception as e:
+                        continue
+        except Exception as e:
+            continue
+    df = pd.DataFrame(rows)
+    return df
+
+# ---------------------------
+# Matching and comparison
+# ---------------------------
+
+def fuzzy_match_claims(df_a, df_b, score_cutoff=80, limit=1):
+    """
+    For each claim in df_a, find best match in df_b using fuzzy matching.
+    Returns merged DataFrame with pairings where match score >= score_cutoff.
+    """
+    choices = df_b['claim'].fillna('').tolist()
+    mapping = []
+    for idx, row in df_a.iterrows():
+        claim = row['claim'] or ''
+        if not claim.strip():
+            continue
+        best = process.extractOne(claim, choices, scorer=fuzz.token_sort_ratio)
+        if best:
+            match_text, score, pos = best  # best is (string, score, index)
+            if score >= score_cutoff:
+                matched_row = df_b.iloc[pos]
+                mapping.append({
+                    'claim_a': claim,
+                    'verdict_a_raw': row.get('verdict_raw'),
+                    'url_a': row.get('url'),
+                    'date_a': row.get('date'),
+                    'claim_b': matched_row.get('claim'),
+                    'verdict_b_raw': matched_row.get('verdict_raw'),
+                    'url_b': matched_row.get('url'),
+                    'date_b': matched_row.get('date'),
+                    'fuzzy_score': score
+                })
+    return pd.DataFrame(mapping)
+
+def prepare_comparison_df(m):
+    """
+    Normalize verdicts and create numeric columns.
+    """
+    if m.empty:
+        return m
+    m = m.copy()
+    m[['score_a','verdict_a_norm']] = m['verdict_a_raw'].apply(lambda x: pd.Series(normalize_verdict(x)))
+    m[['score_b','verdict_b_norm']] = m['verdict_b_raw'].apply(lambda x: pd.Series(normalize_verdict(x)))
+    # Add binary labels for confusion matrix (True vs False) using threshold 0.5
+    m['binary_a'] = (m['score_a'] >= 0.5).astype(int)
+    m['binary_b'] = (m['score_b'] >= 0.5).astype(int)
+    return m
+
+def compute_agreement_stats(df):
+    if df.empty:
+        return {}
+    total = len(df)
+    agree_exact_label = (df['verdict_a_norm'] == df['verdict_b_norm']).sum()
+    agree_binary = (df['binary_a'] == df['binary_b']).sum()
+    # correlation
+    corr = df['score_a'].corr(df['score_b'])
+    return {
+        'total_pairs': total,
+        'agree_exact_label': int(agree_exact_label),
+        'agree_exact_pct': float(agree_exact_label) / total * 100,
+        'agree_binary': int(agree_binary),
+        'agree_binary_pct': float(agree_binary) / total * 100,
+        'score_correlation': corr
+    }
+
+# ---------------------------
 # Streamlit UI
-# --------------------------
-st.title("🔎 Compare Truthfulness: PolitiFact ↔ FactCheck.org")
+# ---------------------------
+
+st.title("BOOM Live ↔ Alt News — Fact-check Comparison")
 st.markdown(
-    """
-    Scrape, normalize, and compare fact-check ratings from PolitiFact and FactCheck.org.
-    - Pick how many pages to scrape (more pages = longer run time).
-    - Fuzzy-match claims across the two sites to find pairs to compare.
-    """
+    "Scrapes recent fact-checks from **BOOM Live** and **Alt News** (India), fuzzy-matches claims, "
+    "normalizes verdict labels and compares truthfulness."
 )
 
 with st.sidebar:
-    st.header("Scrape options")
-    politifact_pages = st.number_input("PolitiFact pages to scrape", min_value=1, max_value=8, value=2, step=1)
-    factcheck_pages = st.number_input("FactCheck.org pages to scrape", min_value=1, max_value=8, value=2, step=1)
-    fuzzy_threshold = st.slider("Fuzzy match threshold (0-100)", min_value=50, max_value=100, value=82)
-    run_scrape = st.button("Scrape & Compare")
+    st.header("Scrape & Match Settings")
+    pages_alt = st.number_input("Alt News pages to scrape", min_value=1, max_value=10, value=2)
+    pages_boom = st.number_input("BOOM pages to scrape", min_value=1, max_value=10, value=2)
+    fuzzy_cutoff = st.slider("Fuzzy match cutoff (0-100)", min_value=50, max_value=100, value=85)
+    show_examples = st.checkbox("Show matched examples", value=True)
+    st.markdown("---")
+    st.write("Options")
+    refresh = st.button("Refresh / Re-scrape (clears cache)")
 
-if run_scrape:
-    with st.spinner("Scraping PolitiFact..."):
-        try:
-            df_p = scrape_politifact_pages(int(politifact_pages))
-            st.success(f"PolitiFact: {len(df_p)} items scraped.")
-        except Exception as e:
-            st.error(f"Error scraping PolitiFact: {e}")
-            st.stop()
-    with st.spinner("Scraping FactCheck.org..."):
-        try:
-            df_f = scrape_factcheck_pages(int(factcheck_pages))
-            st.success(f"FactCheck.org: {len(df_f)} items scraped.")
-        except Exception as e:
-            st.error(f"Error scraping FactCheck.org: {e}")
-            st.stop()
+if refresh:
+    # Clear cached data functions by calling their cache_clear
+    try:
+        fetch_altnews_pages.clear()
+        fetch_boom_pages.clear()
+        st.experimental_rerun()
+    except Exception:
+        st.warning("Could not clear cache programmatically. Reloading page should fetch fresh data.")
 
-    # Show raw tables
-    st.subheader("Raw scraped samples")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**PolitiFact (sample)**")
-        st.dataframe(df_p[['claim','rating_raw','rating_norm','rating_numeric','date_parsed','url']].head(10))
-    with c2:
-        st.markdown("**FactCheck.org (sample)**")
-        st.dataframe(df_f[['claim','rating_raw','rating_norm','rating_numeric','date_parsed','url']].head(10))
+st.info("Scraping pages now — this may take a few seconds depending on pages requested. Results are cached.")
 
-    # Merge using fuzzy matching
-    st.subheader("Fuzzy-match claims across sites")
-    merged = fuzzy_merge(df_p, df_f, left_on='claim', right_on='claim', threshold=fuzzy_threshold)
-    # Create comparison columns
-    # For matched rows attach right-side ratings if present
-    def get_right_rating(row):
-        if 'right_rating_norm' in row.index:
-            return row.get('right_rating_norm', None), row.get('right_rating_numeric', np.nan)
-        return None, np.nan
+with st.spinner("Fetching Alt News..."):
+    df_alt = fetch_altnews_pages(pages=pages_alt)
+with st.spinner("Fetching BOOM Live..."):
+    df_boom = fetch_boom_pages(pages=pages_boom)
 
-    merged['right_rating_norm'] = merged.get('right_rating_norm', merged.get('rating_norm_right', None))
-    merged['right_rating_numeric'] = merged.get('right_rating_numeric', merged.get('rating_numeric_right', np.nan))
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader("Alt News")
+    st.write(f"Scraped posts: {len(df_alt)}")
+    st.dataframe(df_alt[['claim','verdict_raw','date','url']].head(50))
+with col2:
+    st.subheader("BOOM Live")
+    st.write(f"Scraped posts: {len(df_boom)}")
+    st.dataframe(df_boom[['claim','verdict_raw','date','url']].head(50))
 
-    # Normalize guarantee: ensure columns exist
-    if 'rating_norm' not in merged.columns:
-        merged['rating_norm'] = merged['rating_norm']
-    if 'rating_numeric' not in merged.columns:
-        merged['rating_numeric'] = merged['rating_numeric']
+# Allow user to optionally upload CSVs instead of scraping
+st.markdown("---")
+st.subheader("Optional: Upload your own CSVs instead of scraping")
+st.markdown("CSV should have columns: `claim`, `verdict_raw`, `url` (optional), `date` (optional)")
+upload_alt = st.file_uploader("Upload Alt News CSV", type=['csv'], key='u1')
+upload_boom = st.file_uploader("Upload BOOM CSV", type=['csv'], key='u2')
 
-    # Filter to matched only
-    matched_pairs = merged[merged['matched_claim_right'].notna()].copy()
-    st.write(f"Found **{len(matched_pairs)}** matched claim pairs (threshold={fuzzy_threshold}).")
-    if matched_pairs.empty:
-        st.info("No matched claims found with current threshold. Try lowering the threshold or increasing pages.")
+if upload_alt is not None:
+    try:
+        user_alt = pd.read_csv(upload_alt)
+        df_alt = user_alt
+        st.success("Loaded Alt CSV - using uploaded data.")
+    except Exception as e:
+        st.error("Failed to read Alt CSV: " + str(e))
+if upload_boom is not None:
+    try:
+        user_boom = pd.read_csv(upload_boom)
+        df_boom = user_boom
+        st.success("Loaded BOOM CSV - using uploaded data.")
+    except Exception as e:
+        st.error("Failed to read BOOM CSV: " + str(e))
+
+# Run fuzzy matching in both directions optionally, but primary: Alt -> Boom
+st.markdown("---")
+st.subheader("Matching & Comparison")
+if df_alt.empty or df_boom.empty:
+    st.warning("Need non-empty data from both sources. Try increasing pages to scrape or upload CSVs.")
+else:
+    with st.spinner("Fuzzy-matching claims..."):
+        matches = fuzzy_match_claims(df_alt, df_boom, score_cutoff=fuzzy_cutoff)
+        comp = prepare_comparison_df(matches)
+    stats = compute_agreement_stats(comp)
+    st.metric("Matched pairs", stats.get('total_pairs', 0))
+    st.metric("Exact-label agreement (%)", f"{stats.get('agree_exact_pct', 0):.1f}%")
+    st.metric("Binary agreement (%)", f"{stats.get('agree_binary_pct', 0):.1f}%")
+    corr = stats.get('score_correlation', None)
+    st.metric("Score correlation (Pearson)", f"{corr:.3f}" if pd.notna(corr) else "N/A")
+
+    if comp.empty:
+        st.info("No matches above the fuzzy cutoff. Try lowering the cutoff or scraping more pages.")
     else:
-        # Prepare for analysis
-        matched_pairs['pf_rating_numeric'] = matched_pairs['rating_numeric'].astype(float)
-        # attempt to fetch right rating numeric from right_ prefix if exists, else from columns
-        if 'right_rating_numeric' in matched_pairs.columns and matched_pairs['right_rating_numeric'].notna().any():
-            matched_pairs['fc_rating_numeric'] = matched_pairs['right_rating_numeric'].astype(float)
-            matched_pairs['fc_rating_norm'] = matched_pairs['right_rating_norm']
-        else:
-            # maybe available as rating_numeric_right
-            if 'rating_numeric_right' in matched_pairs.columns:
-                matched_pairs['fc_rating_numeric'] = matched_pairs['rating_numeric_right'].astype(float)
-                matched_pairs['fc_rating_norm'] = matched_pairs['rating_norm_right']
-            else:
-                matched_pairs['fc_rating_numeric'] = matched_pairs['rating_numeric'] * np.nan
-                matched_pairs['fc_rating_norm'] = None
+        if show_examples:
+            st.subheader("Matched examples (top 20 by fuzzy score)")
+            st.dataframe(comp.sort_values('fuzzy_score', ascending=False).head(20)[[
+                'fuzzy_score','claim_a','verdict_a_raw','verdict_a_norm','score_a',
+                'claim_b','verdict_b_raw','verdict_b_norm','score_b','url_a','url_b'
+            ]])
 
-        # show matched table
-        st.subheader("Matched pairs (sample)")
-        display_cols = ['claim', 'rating_norm', 'pf_rating_numeric', 'matched_claim_right', 'fc_rating_norm', 'fc_rating_numeric', 'match_score', 'url', 'right_url'] if 'right_url' in matched_pairs.columns else ['claim','rating_norm','pf_rating_numeric','matched_claim_right','fc_rating_norm','fc_rating_numeric','match_score','url']
-        # ensure columns exist
-        for c in ['right_url','url','matched_claim_right']:
-            if c not in matched_pairs.columns:
-                matched_pairs[c] = None
-        st.dataframe(matched_pairs[['claim','rating_norm','pf_rating_numeric','matched_claim_right','fc_rating_norm','fc_rating_numeric','match_score','url','right_url']].head(20))
+        # Scatter plot of numeric scores
+        st.subheader("Numeric Verdict Comparison (normalized scores)")
+        fig, ax = plt.subplots()
+        ax.scatter(comp['score_a'], comp['score_b'])
+        ax.set_xlabel("Alt News normalized score")
+        ax.set_ylabel("BOOM normalized score")
+        ax.set_title("Scatter: Alt News vs BOOM normalized verdict scores")
+        # draw y=x line
+        ax.plot([0,1],[0,1], linestyle='--')
+        st.pyplot(fig)
 
-        # Drop NaNs for numeric comparison
-        comp = matched_pairs.dropna(subset=['pf_rating_numeric','fc_rating_numeric']).copy()
-        if comp.empty:
-            st.warning("No matched pairs have numeric ratings on both sides. The parsers may have failed to extract rating text for FactCheck.org. Consider increasing pages or inspecting the raw data.")
-        else:
-            # Correlation
-            corr = comp['pf_rating_numeric'].corr(comp['fc_rating_numeric'], method='pearson')
-            st.metric("Pearson correlation between numeric ratings", f"{corr:.3f}")
+        # Confusion matrix for binary labels
+        st.subheader("Binary Confusion Matrix (True vs False)")
+        y_true = comp['binary_a']
+        y_pred = comp['binary_b']
+        cm = confusion_matrix(y_true, y_pred, labels=[1,0])  # 1=True, 0=False
+        fig2, ax2 = plt.subplots()
+        im = ax2.imshow(cm, interpolation='nearest')
+        ax2.set_xlabel('BOOM predicted (binary)')
+        ax2.set_ylabel('Alt News actual (binary)')
+        ax2.set_xticks([0,1])
+        ax2.set_xticklabels(['True','False'])
+        ax2.set_yticks([0,1])
+        ax2.set_yticklabels(['True','False'])
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax2.text(j, i, format(cm[i, j], 'd'), ha="center", va="center", color="w")
+        ax2.set_title("Confusion matrix (AltNews vs BOOM)")
+        st.pyplot(fig2)
 
-            # Scatter plot
-            st.subheader("Scatter: PolitiFact vs FactCheck.org (numeric ratings)")
-            fig = px.scatter(comp, x='pf_rating_numeric', y='fc_rating_numeric',
-                             hover_data=['claim','matched_claim_right','match_score'],
-                             labels={'pf_rating_numeric':'PolitiFact (numeric)','fc_rating_numeric':'FactCheck.org (numeric)'},
-                             title="Rating scatter plot")
-            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("---")
+        st.subheader("Export matched comparison")
+        csv = comp.to_csv(index=False)
+        st.download_button("Download matched CSV", data=csv, file_name="alt_boom_matched.csv", mime="text/csv")
 
-            # Binarize for agreement: define truth threshold (>=0.5 -> True)
-            comp['pf_bin'] = (comp['pf_rating_numeric'] >= 0.5).astype(int)
-            comp['fc_bin'] = (comp['fc_rating_numeric'] >= 0.5).astype(int)
-            agreement = (comp['pf_bin'] == comp['fc_bin']).mean()
-            st.write(f"Agreement rate (binary): **{agreement:.2%}** (threshold 0.5)")
-
-            # Confusion matrix
-            cm = confusion_matrix(comp['pf_bin'], comp['fc_bin'], labels=[1,0])
-            fig2, ax = plt.subplots()
-            im = ax.imshow(cm, interpolation='nearest')
-            ax.set_title("Confusion matrix (rows: PolitiFact, cols: FactCheck.org) 1=True,0=False")
-            ax.set_xticks([0,1])
-            ax.set_yticks([0,1])
-            ax.set_xticklabels(['True','False'])
-            ax.set_yticklabels(['True','False'])
-            for i in range(cm.shape[0]):
-                for j in range(cm.shape[1]):
-                    ax.text(j, i, cm[i, j], ha="center", va="center", color="w")
-            st.pyplot(fig2)
-
-            # Show examples of disagreements
-            st.subheader("Examples of disagreement (sample)")
-            disag = comp[comp['pf_bin'] != comp['fc_bin']].copy()
-            st.write(f"{len(disag)} disagreements found")
-            if not disag.empty:
-                # show a few with links
-                sample = disag.sample(min(10, len(disag)), random_state=1)
-                out = sample[['claim','rating_norm','pf_rating_numeric','matched_claim_right','fc_rating_norm','fc_rating_numeric','match_score','url','right_url' if 'right_url' in sample.columns else None]].copy()
-                # clean columns
-                out = out.loc[:, ~out.columns.isnull()]
-                st.dataframe(out)
-
-    st.success("Analysis complete.")
-
-# If not run yet, show examples and instructions
-if not run_scrape:
-    st.info("Set options in the sidebar and click **Scrape & Compare** to start.")
-    st.markdown("**Notes & tips**:")
-    st.markdown("""
-    - Start with small page numbers (1-3). PolitiFact and FactCheck have dozens/hundreds of pages.
-    - If you get few or no matches: increase pages or lower the fuzzy threshold.
-    - This app uses fuzzy text matching — not a perfect 'claim identity' test. Claims that are reworded a lot may not match.
-    - If you need reproducible datasets, add a CSV upload feature (I can add that if you want).
-    """)
+st.markdown("---")
+st.write("Developer notes:")
+st.write("""
+- If verdict extraction misses some pages, open the post URL and inspect HTML to adjust selectors in the scraping functions.
+- You can change the `VERDICT_MAPPING` dictionary to better reflect site-specific labels.
+- Fuzzy matching can be run in the other direction (BOOM -> Alt) to find additional pairs — you can add that similarly.
+""")
+st.write("Done — try adjusting pages and fuzzy cutoff to get more or fewer matches.")
