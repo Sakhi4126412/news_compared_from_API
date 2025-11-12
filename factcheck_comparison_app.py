@@ -8,7 +8,57 @@ CLAIMBUSTER_API_KEY = "YOUR_CLAIMBUSTER_API_KEY"
 st.set_page_config(page_title="Fact Check Comparator", page_icon="🕵️", layout="centered")
 
 st.title("🕵️ Fact Check Comparator")
-st.write("Compare the truthfulness of a news claim using Google Fact Check and ClaimBuster APIs.")
+st.write("Compare the truthfulness of news claims using Google Fact Check and ClaimBuster APIs.")
+
+# -------------------------------
+# 🔥 Display Top Fact-Checked News
+# -------------------------------
+st.header("📰 Top Fact-Checked News")
+
+# Google Fact Check Highlights
+st.subheader("📚 Google Fact Check Highlights")
+google_highlights = [
+    {
+        "claim": "Brazilian hairdresser Larissa Nery called Rahul Gandhi a ‘failed politician’.",
+        "rating": "False",
+        "source": "India Today",
+        "url": "https://toolbox.google.com/factcheck/explorer"
+    },
+    {
+        "claim": "Dehradun University awarded 50 marks for attending PM Modi’s rally.",
+        "rating": "False",
+        "source": "BOOM",
+        "url": "https://toolbox.google.com/factcheck/explorer"
+    },
+    {
+        "claim": "Drunk man pets Bengal Tiger in Pench, Madhya Pradesh.",
+        "rating": "False (AI-generated)",
+        "source": "DigitEye India",
+        "url": "https://toolbox.google.com/factcheck/explorer"
+    }
+]
+
+for item in google_highlights:
+    st.markdown(f"**Claim:** {item['claim']}")
+    st.markdown(f"- **Rating:** {item['rating']}")
+    st.markdown(f"- **Source:** {item['source']}")
+    st.markdown(f"- [View Source]({item['url']})")
+
+# ClaimBuster Highlights (Static examples)
+st.subheader("🔍 ClaimBuster Highlights")
+claimbuster_examples = [
+    "The U.S. economy added 300,000 jobs last month.",
+    "COVID vaccines contain microchips.",
+    "India is the fastest-growing major economy in the world."
+]
+
+for example in claimbuster_examples:
+    st.markdown(f"- **Claim:** {example}")
+
+# -------------------------------
+# 🧪 Claim Verification Section
+# -------------------------------
+st.header("🔎 Verify a News Claim")
 
 claim = st.text_input("Enter a news claim to verify:")
 
