@@ -1,8 +1,5 @@
-streamlit>=1.40.0
-requests>=2.32.0
-beautifulsoup4>=4.12.3
-pandas>=2.2.2
-rapidfuzz>=3.10.0
-matplotlib>=3.9.2
-scikit-learn>=1.5.2
-python-dateutil>=2.9.0
+streamlit>=1.38.0
+pandas>=2.0.3
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+feedparser>=6.0.11
